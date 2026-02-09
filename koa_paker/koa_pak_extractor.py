@@ -75,7 +75,8 @@ class EntryBlob:
 
 
 def read_header(pak_path: Path) -> PakHeader:
-    data = pak_path.read_bytes()[:24]
+    with pak_path.open("rb") as f:
+        data = f.read(24)
     if len(data) < 24:
         raise ValueError(f"{pak_path} too small to be a .pak")
     magic = data[:4]
@@ -103,7 +104,9 @@ def read_entry_blob(pak_path: Path, header: PakHeader, entry: TocEntry) -> Entry
         uncompressed_size, chunk_count = struct.unpack("<II", header_bytes)
         sizes = list(struct.unpack("<" + "I" * chunk_count, f.read(chunk_count * 4)))
         data_offset = f.tell()
-    compressed_size = sum(sizes)
+    # chunk_count == 0 is a valid "raw" storage mode in stock packs:
+    # data follows directly after the 8-byte per-entry header.
+    compressed_size = sum(sizes) if chunk_count > 0 else uncompressed_size
     end_offset = data_offset + compressed_size
     return EntryBlob(
         offset=offset,
@@ -255,6 +258,16 @@ def _decompress_entry(
     pak_path: Path, header: PakHeader, entry: TocEntry, verbose: bool = False
 ) -> bytes:
     blob = read_entry_blob(pak_path, header, entry)
+    if blob.chunk_count == 0:
+        with pak_path.open("rb") as f:
+            f.seek(blob.data_offset)
+            data = f.read(blob.uncompressed_size)
+        if len(data) != blob.uncompressed_size:
+            raise ValueError(
+                f"raw entry short read ({len(data)} != {blob.uncompressed_size})"
+            )
+        return data
+
     remaining = blob.uncompressed_size
     out = bytearray()
     with pak_path.open("rb") as f:

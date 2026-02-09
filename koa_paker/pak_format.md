@@ -67,6 +67,8 @@ Notes:
 - `chunk_count` is typically `ceil(uncompressed_size / 0x1000)`.
 - `chunk_data` is a concatenation of `chunk_count` compressed chunks.
 - The last chunk can be shorter than 0x1000 after decompression.
+- `chunk_count == 0` is valid and means raw data follows directly:
+  `u8 raw_data[uncompressed_size]` (no custom chunk decompression).
 
 ## Compression (`fcn.140012800`)
 
@@ -147,8 +149,9 @@ This layout matches what the existing `assetinfos_tool.py` parser expects.
 
 ## Known Tools
 
-- `unpacked/koa_pak_extractor.py`: TOC parsing + decompression + extraction.
-- `unpacked/assetinfos_tool.py`: name table parsing and CSV export.
+- `koa_pak_extractor.py`: TOC parsing + decompression + extraction.
+- `assetinfos_tool.py`: name table parsing and CSV export.
+- `koa_pak_builder.py`: simple KARl/v1 mod pack builder (raw entries).
 
 ## Open Questions
 
