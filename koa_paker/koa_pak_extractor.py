@@ -14,7 +14,7 @@ This script follows the read order observed in the game's unpacker:
       countA entries of (u32 a, u32 b, u32 c)
 
 Observed entry semantics for initial_0.pak (KARl, version=1):
-  - a == CRC32(filename) for most filenames in assetinfos.bin
+  - a == CRC32(filename)
   - b == data offset in units of block_size (header block_size is 16)
   - c low 31 bits == uncompressed size, high bit appears to be a flag
 
@@ -26,6 +26,11 @@ At offset = b * block_size, the file data begins with:
 
 Compression details are based on fcn.140012800 (custom bitstream LZ variant).
 See unpacked/pak_format.md for full format notes.
+
+Name resolution:
+  - If provided, assetinfos.bin can provide name candidates.
+  - Stock packs also include an internal `_filenames.bin` entry that maps
+    CRC32 -> filename and can be used to resolve names without assetinfos.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ import struct
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass
@@ -72,6 +77,9 @@ class EntryBlob:
     data_offset: int
     compressed_size: int
     end_offset: int
+
+
+FILENAMES_BLOB_NAME = "_filenames.bin"
 
 
 def read_header(pak_path: Path) -> PakHeader:
@@ -141,6 +149,85 @@ def load_assetinfos(assetinfos_path: Path) -> List[str]:
 
 def crc32_name(name: str) -> int:
     return zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF
+
+
+def parse_filenames_blob(data: bytes) -> Tuple[Dict[int, str], List[str], Optional[Tuple[int, int]]]:
+    """
+    Parse the unpacker's internal filenames blob.
+
+    Observed layout:
+      repeat:
+        u32 name_hash
+        u32 name_len
+        char name[name_len]
+      optional trailer:
+        u32 countA
+        u32 countB
+    """
+    crc_name_map: Dict[int, str] = {}
+    names: List[str] = []
+    trailer_counts: Optional[Tuple[int, int]] = None
+    pos = 0
+
+    while pos + 8 <= len(data):
+        # Stock packs end with an 8-byte trailer (countA, countB).
+        if pos + 8 == len(data):
+            trailer_counts = struct.unpack_from("<II", data, pos)
+            pos += 8
+            break
+
+        name_hash, name_len = struct.unpack_from("<II", data, pos)
+        pos += 8
+        if name_len == 0 or pos + name_len > len(data):
+            raise ValueError(
+                f"invalid _filenames.bin entry length {name_len} at offset 0x{pos - 8:X}"
+            )
+
+        name_bytes = data[pos : pos + name_len]
+        pos += name_len
+        try:
+            name = name_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            name = name_bytes.decode("latin-1")
+
+        actual_hash = crc32_name(name)
+        if actual_hash != name_hash:
+            raise ValueError(
+                f"_filenames.bin hash mismatch for '{name}': "
+                f"stored=0x{name_hash:08X} actual=0x{actual_hash:08X}"
+            )
+
+        # Keep the first mapping if collisions exist.
+        if name_hash not in crc_name_map:
+            crc_name_map[name_hash] = name
+        names.append(name)
+
+    if pos != len(data):
+        raise ValueError(f"_filenames.bin parse ended at {pos}, file size is {len(data)}")
+
+    return crc_name_map, names, trailer_counts
+
+
+def load_filenames_from_pak(
+    pak_path: Path, header: PakHeader
+) -> Tuple[Dict[int, str], List[str], Optional[Tuple[int, int]]]:
+    filenames_hash = crc32_name(FILENAMES_BLOB_NAME)
+    target_entry: Optional[TocEntry] = None
+    for entry in iter_toc_entries(pak_path, header):
+        if entry.a == filenames_hash:
+            target_entry = entry
+            break
+
+    if target_entry is None:
+        return {}, [], None
+
+    blob = decompress_entry(pak_path, header, target_entry)
+    crc_name_map, names, trailer_counts = parse_filenames_blob(blob)
+    # _filenames.bin does not list itself; add it so extraction can name it.
+    if filenames_hash not in crc_name_map:
+        crc_name_map[filenames_hash] = FILENAMES_BLOB_NAME
+        names.append(FILENAMES_BLOB_NAME)
+    return crc_name_map, names, trailer_counts
 
 
 class BitReader:
@@ -307,6 +394,11 @@ def main() -> int:
     parser.add_argument("--name", help="Filename to hash (CRC32) and lookup")
     parser.add_argument("--hash", dest="hash_value", help="Hex or decimal hash to lookup")
     parser.add_argument("--assetinfos", type=Path, help="assetinfos.bin for name candidates")
+    parser.add_argument(
+        "--no-filenames-bin",
+        action="store_true",
+        help="Disable automatic name lookup via in-pack _filenames.bin.",
+    )
     parser.add_argument("--limit", type=int, default=20, help="Limit matches printed")
     parser.add_argument(
         "--inspect",
@@ -321,7 +413,7 @@ def main() -> int:
     parser.add_argument(
         "--dump-all",
         action="store_true",
-        help="Dump all entries (requires --assetinfos for filenames).",
+        help="Dump all entries; filenames come from --assetinfos or in-pack _filenames.bin.",
     )
     parser.add_argument(
         "--extract",
@@ -353,18 +445,48 @@ def main() -> int:
         print(f"hash=0x{lookup_hash:08X} ({lookup_hash})")
 
     crc_name_map: dict[int, str] = {}
-    # Optional: list candidate names for the hash and build a crc->name map
+    candidate_names: List[str] = []
+    # Optional: list candidate names for the hash and build a crc->name map.
     if args.assetinfos:
         names = load_assetinfos(args.assetinfos)
+        candidate_names.extend(names)
         for n in names:
             crc = crc32_name(n)
             if crc not in crc_name_map:
                 crc_name_map[crc] = n
-        if lookup_hash is not None:
-            matches = [n for n in names if crc32_name(n) == lookup_hash]
-            print(f"assetinfos candidates: {len(matches)}")
-            for n in matches[: args.limit]:
-                print(f"  {n}")
+        if args.verbose:
+            print(f"loaded {len(names)} names from assetinfos")
+
+    if not args.no_filenames_bin:
+        try:
+            fn_map, fn_names, trailer_counts = load_filenames_from_pak(args.pak, header)
+            candidate_names.extend(fn_names)
+            added = 0
+            for crc, name in fn_map.items():
+                if crc not in crc_name_map:
+                    crc_name_map[crc] = name
+                    added += 1
+            if fn_names:
+                print(f"in-pack _filenames.bin names: {len(fn_names)} (added {added} mappings)")
+                if args.verbose and trailer_counts is not None:
+                    print(
+                        f"_filenames.bin trailer: countA={trailer_counts[0]} countB={trailer_counts[1]}"
+                    )
+        except Exception as exc:
+            print(f"warning: failed to parse in-pack _filenames.bin: {exc}")
+
+    if lookup_hash is not None and candidate_names:
+        matches: List[str] = []
+        seen: set[str] = set()
+        for n in candidate_names:
+            if n in seen:
+                continue
+            seen.add(n)
+            if crc32_name(n) == lookup_hash:
+                matches.append(n)
+        print(f"name candidates: {len(matches)}")
+        for n in matches[: args.limit]:
+            print(f"  {n}")
 
     # Scan TOC
     countA = 0

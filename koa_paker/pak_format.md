@@ -130,10 +130,24 @@ while cont == 1
 return value
 ```
 
-## Name Mapping (`assetinfos.bin`)
+## Name Mapping (`_filenames.bin` and `assetinfos.bin`)
 
-Filenames are *not* stored in the `.pak` TOC. The game uses `assetinfos.bin`
-files to map names to CRC32:
+Filenames are *not* stored directly in the `.pak` TOC. Stock packs contain an
+internal `_filenames.bin` entry (its TOC hash is `CRC32("_filenames.bin")`).
+That blob maps file hash -> filename and is enough to name almost every entry.
+
+Observed `_filenames.bin` payload layout:
+
+```
+repeat:
+  u32 name_hash     // CRC32(filename)
+  u32 name_len
+  char[name_len] name
+u32 trailer_countA
+u32 trailer_countB
+```
+
+Additionally, the game also uses `assetinfos.bin` files to map asset IDs to names:
 
 ```
 u32 countA
