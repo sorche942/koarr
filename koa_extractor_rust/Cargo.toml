@@ -1,0 +1,12 @@
+[package]
+name = "koa_extractor_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+memmap2 = "0.9"
+rayon = "1.8"
+crc32fast = "1.3"
+byteorder = "1.5"
+anyhow = "1.0"

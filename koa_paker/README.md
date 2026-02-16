@@ -4,7 +4,9 @@ This folder contains:
 
 - `koa_pak_extractor.py`: inspect/extract `.pak` contents.
 - `assetinfos_tool.py`: inspect `assetinfos.bin`.
+- `questmgr_tool.py`: parse and export `QuestMgr.bin` sections.
 - `koa_pak_builder.py`: build mod `.pak` files for use with `koa_pak_hook`.
+- `questmgr_format.md`: observed binary layout notes for `QuestMgr.bin`.
 
 ## Extract Pak Files
 
@@ -66,3 +68,21 @@ Use `--hash-mode as-is` if you need exact-case hashing.
 
 Then copy your built pak to the game folder so it resolves as
 `/mods/core_fix.pak` for `koa_pak_hook`.
+
+## Parse QuestMgr.bin
+
+Print section counts and consistency checks:
+
+```bash
+python3 questmgr_tool.py \
+  --input /path/to/questmgr.bin \
+  stats
+```
+
+Dump parsed sections to JSON:
+
+```bash
+python3 questmgr_tool.py \
+  --input /path/to/questmgr.bin \
+  dump --out /path/to/questmgr.json
+```

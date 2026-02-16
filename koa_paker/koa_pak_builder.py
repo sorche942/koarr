@@ -174,6 +174,36 @@ def write_raw_file_data(f, src: Path, size: int) -> None:
             remaining -= len(chunk)
 
 
+def generate_filenames_bin(entries: List[SourceEntry]) -> bytes:
+    data = bytearray()
+    # Add an entry for _filenames.bin itself so it is listed (optional but good practice)
+    # Actually, standard paks don't usually list _filenames.bin inside _filenames.bin, but let's stick to entries.
+    
+    # Sort by hash for consistency
+    sorted_entries = sorted(entries, key=lambda e: e.hash_value)
+    
+    for e in sorted_entries:
+        name_bytes = e.virtual_path.encode("utf-8")
+        # Ensure we use the hash used for the TOC (which might be lowercased)
+        # But the name stored is the original virtual path.
+        # Check if we should store the lowercased name or original.
+        # The extractor says: "actual_hash = crc32_name(name); if actual_hash != name_hash: mismatch"
+        # This implies the name stored in the blob MUST hash to the stored hash.
+        # If hash_mode is "lower", e.hash_value is CRC32(path.lower()).
+        # So we must store path.lower() in the blob if we want it to match?
+        # Or does the game/extractor normalize the name read from the blob?
+        # The extractor parses the name, then hashes it. If we store "MyFile", it hashes "MyFile".
+        # If e.hash_value is CRC32("myfile"), then CRC32("MyFile") != e.hash_value.
+        # So we MUST store the name that produces the hash.
+        
+        name_to_store = e.hash_name # This is lowercased if hash_mode='lower'
+        name_bytes = name_to_store.encode("utf-8")
+        
+        data.extend(struct.pack("<II", e.hash_value, len(name_bytes)))
+        data.extend(name_bytes)
+        
+    return bytes(data)
+
 def build_pak(
     entries: List[SourceEntry],
     output_path: Path,
@@ -181,41 +211,76 @@ def build_pak(
     block_size: int,
     field44: int,
 ) -> List[TocEntry]:
+    # Generate _filenames.bin
+    filenames_data = generate_filenames_bin(entries)
+    
+    # Create a temporary file for _filenames.bin or write it directly?
+    # We can handle it as a special case in the loop or add a SourceEntry for it.
+    # Adding a SourceEntry is cleaner but SourceEntry expects a source_path.
+    # Let's write it to a temp file.
+    
+    import tempfile
+    import os
+    
     toc_entries: List[TocEntry] = []
-    with output_path.open("wb") as f:
-        # Placeholder header; TOC offset is patched after data is written.
-        f.write(struct.pack("<4sIIIQ", DEFAULT_MAGIC, DEFAULT_VERSION, block_size, field44, 0))
+    
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_filenames:
+        temp_filenames_path = Path(tmp_filenames.name)
+        tmp_filenames.write(filenames_data)
+        
+    try:
+        # Add _filenames.bin to entries list
+        filenames_hash_name = "_filenames.bin" # always lowercase
+        filenames_entry = SourceEntry(
+            virtual_path="_filenames.bin",
+            source_path=temp_filenames_path,
+            size=len(filenames_data),
+            hash_name=filenames_hash_name,
+            hash_value=crc32_name(filenames_hash_name)
+        )
+        
+        # We append it to the list. Note: verify if it should be sorted in TOC.
+        # TOC sorting happens later.
+        all_entries = entries + [filenames_entry]
 
-        for e in entries:
-            write_aligned_padding(f, block_size)
-            offset = f.tell()
-            if offset % block_size != 0:
-                raise RuntimeError("entry offset alignment failure")
+        with output_path.open("wb") as f:
+            # Placeholder header; TOC offset is patched after data is written.
+            f.write(struct.pack("<4sIIIQ", DEFAULT_MAGIC, DEFAULT_VERSION, block_size, field44, 0))
 
-            # Per-entry header:
-            #   u32 uncompressed_size
-            #   u32 chunk_count (=0 => raw data follows)
-            f.write(struct.pack("<II", e.size, 0))
-            write_raw_file_data(f, e.source_path, e.size)
+            for e in all_entries:
+                write_aligned_padding(f, block_size)
+                offset = f.tell()
+                if offset % block_size != 0:
+                    raise RuntimeError("entry offset alignment failure")
 
-            toc_entries.append(
-                TocEntry(
-                    hash_value=e.hash_value,
-                    offset_units=offset // block_size,
-                    size=e.size,
-                    virtual_path=e.virtual_path,
-                    source_path=e.source_path,
+                # Per-entry header:
+                #   u32 uncompressed_size
+                #   u32 chunk_count (=0 => raw data follows)
+                f.write(struct.pack("<II", e.size, 0))
+                write_raw_file_data(f, e.source_path, e.size)
+
+                toc_entries.append(
+                    TocEntry(
+                        hash_value=e.hash_value,
+                        offset_units=offset // block_size,
+                        size=e.size,
+                        virtual_path=e.virtual_path,
+                        source_path=e.source_path,
+                    )
                 )
-            )
 
-        toc_offset = f.tell()
-        sorted_toc = sorted(toc_entries, key=lambda t: (t.hash_value, t.virtual_path))
-        f.write(struct.pack("<II", len(sorted_toc), 0))
-        for e in sorted_toc:
-            f.write(struct.pack("<III", e.hash_value, e.offset_units, e.size))
+            toc_offset = f.tell()
+            sorted_toc = sorted(toc_entries, key=lambda t: (t.hash_value, t.virtual_path))
+            f.write(struct.pack("<II", len(sorted_toc), 0))
+            for e in sorted_toc:
+                f.write(struct.pack("<III", e.hash_value, e.offset_units, e.size))
 
-        f.seek(0)
-        f.write(struct.pack("<4sIIIQ", DEFAULT_MAGIC, DEFAULT_VERSION, block_size, field44, toc_offset))
+            f.seek(0)
+            f.write(struct.pack("<4sIIIQ", DEFAULT_MAGIC, DEFAULT_VERSION, block_size, field44, toc_offset))
+            
+    finally:
+        if temp_filenames_path.exists():
+            os.unlink(temp_filenames_path)
 
     return sorted_toc
 
